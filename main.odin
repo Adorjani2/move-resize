@@ -48,7 +48,7 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 
 	if need_to_clear_state {
 		clear_state()
-		return win.CallNextHookEx(nil, code, msg_id, ptr_msllhook)
+		return 1
 	}
 
 	outter_switch: switch g_state.state {
@@ -97,11 +97,11 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 					} else {
 						final_state.resize_type = ms.y > wsh.y ? .Bottom_Left : .Top_Left
 					}
-
-					fmt.printfln("s: %v, c: %v, t: %v", final_state.mouse_at_start, ms, final_state.resize_type)
 				}
 
 				g_state._state = final_state
+
+				return 1
 			}
 		}
 
