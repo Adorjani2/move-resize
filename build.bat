@@ -1,1 +1,1 @@
-odin build . -o:speed -subsystem:windows
+odin build ./src -out:move_resize.exe -o:speed -subsystem:windows
