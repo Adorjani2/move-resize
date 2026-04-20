@@ -226,7 +226,48 @@ are_mod_keys_down :: proc() -> bool {
 
 
 
+window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) -> win.LRESULT {
+	switch (msg) {
+	    case win.WM_DESTROY: {
+	        win.PostQuitMessage(0)
+	        return 0
+	    }
+    }
+
+	return win.DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+
+
 main :: proc() {
+	// setup windows shits (for the system tray bs)
+	instance := win.HINSTANCE(win.GetModuleHandleW(nil))
+	assert(instance != nil, "Failed to get exe instance")
+
+	CLASS_NAME :: cstring16("move_resize")
+	window_class := win.WNDCLASSW {
+		lpfnWndProc = window_proc,
+		lpszClassName = CLASS_NAME,
+		hInstance = instance,
+	}
+	class := win.RegisterClassW(&window_class)
+	assert(class != 0, "Failed to create class")
+
+	hwnd := win.CreateWindowW(
+		CLASS_NAME,
+		cstring16("test"),
+		0,
+		win.CW_USEDEFAULT, win.CW_USEDEFAULT, win.CW_USEDEFAULT, win.CW_USEDEFAULT,
+		nil,
+		nil,
+		instance,
+		nil
+	)
+	assert(hwnd != nil, "Failed to create window")
+
+
+
+	// setup hook shit
 	hook_handle := win.SetWindowsHookExW(win.WH_MOUSE_LL, hook_on_mouse_event, nil, 0)
 
 	for &k in g_state.mod_keys {
@@ -235,6 +276,7 @@ main :: proc() {
 	g_state.mod_keys[0] = win.VK_SHIFT
 	g_state.mod_keys[1] = win.VK_CONTROL
 
+	//
 	msg: win.MSG
 	for win.GetMessageW(&msg, nil, 0, 0) != 0 {
 		win.TranslateMessage(&msg)
