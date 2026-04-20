@@ -86,6 +86,14 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 					break outter_switch
 				}
 
+				fullscreen_size := [?]win.LONG{
+					win.GetSystemMetrics(win.SM_CXSCREEN),
+					win.GetSystemMetrics(win.SM_CYSCREEN)
+				}
+				if get_rect_size(final_state.win_rect_at_start) == fullscreen_size {
+					return 1
+				}
+
 				if !win.GetCursorPos(&final_state.mouse_at_start) {
 					break outter_switch
 				}
