@@ -1,1 +1,1 @@
-odin build . -o:speed
+odin build . -o:speed -subsystem:windows

@@ -273,7 +273,6 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 
 	    		case COMMAND_TOGGLE_ENABLE: {
 	    			g_state.enabled = !g_state.enabled
-	    			
 	    		}
 	    	}
 	    }
@@ -300,7 +299,7 @@ main :: proc() {
 
 	hwnd := win.CreateWindowW(
 		CLASS_NAME,
-		cstring16("mover sizer"),
+		CLASS_NAME,
 		0,
 		10, 10, 10, 10,
 		nil,
