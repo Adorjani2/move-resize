@@ -17,6 +17,6 @@ simply run build.bat
 2. Add shortcut to the .exe in the directory that opened up
 
 ## TODO
-[] exclude specific apps
-[] customizable shortcut
-[] icon for systray and exe
+- [] exclude specific apps
+- [] customizable shortcut
+- [] icon for systray and exe
