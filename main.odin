@@ -15,6 +15,11 @@ foreign user32 {
 
 
 MAX_MOD_KEYS :: 3
+CONTEXT_MENU_MSG :: win.WM_APP + 1
+
+COMMAND_EXIT :: 1
+COMMAND_TOGGLE_ENABLE :: 2
+
 
 App_State :: struct {
 	state : enum {None, Moving, Resizing},
@@ -29,13 +34,14 @@ App_State :: struct {
 
 g_state := struct {
 	mod_keys     : [MAX_MOD_KEYS]win.INT,
+	enabled      : bool,
 	using _state : App_State,
 }{}
 
 
 // https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelmouseproc
 hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_msllhook: win.LPARAM) -> win.LRESULT {
-	if code < 0 {
+	if code < 0 || !g_state.enabled {
 		return win.CallNextHookEx(nil, code, msg_id, ptr_msllhook)
 	}
 
@@ -227,10 +233,49 @@ are_mod_keys_down :: proc() -> bool {
 
 
 window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) -> win.LRESULT {
-	switch (msg) {
+	context = runtime.default_context()
+
+	switch msg {
 	    case win.WM_DESTROY: {
 	        win.PostQuitMessage(0)
 	        return 0
+	    }
+
+	    case CONTEXT_MENU_MSG: {
+	    	if lparam != win.WM_RBUTTONUP {
+	    		break
+	    	}
+
+	    	fmt.println("menu")
+
+	    	p : win.POINT
+	    	win.GetCursorPos(&p)
+
+	    	menu := win.CreatePopupMenu()
+	    	win.AppendMenuW(
+	    		menu,
+	    		win.MF_STRING | win.MF_ENABLED | (g_state.enabled ? win.MF_CHECKED : win.MF_UNCHECKED),
+	    		COMMAND_TOGGLE_ENABLE,
+	    		cstring16("Enabled")
+	    	)
+	    	win.AppendMenuW(menu, win.MF_STRING | win.MF_ENABLED, COMMAND_EXIT, cstring16("Exit"))
+
+	    	win.SetForegroundWindow(hwnd)
+	    	win.TrackPopupMenu(menu, win.TPM_LEFTALIGN, p.x, p.y, 0, hwnd, nil)
+	    }
+
+	    case win.WM_COMMAND: {
+	    	switch wparam {
+	    		case COMMAND_EXIT: {
+			        win.PostQuitMessage(0)
+			        return 0
+	    		}
+
+	    		case COMMAND_TOGGLE_ENABLE: {
+	    			g_state.enabled = !g_state.enabled
+	    			
+	    		}
+	    	}
 	    }
     }
 
@@ -246,18 +291,18 @@ main :: proc() {
 
 	CLASS_NAME :: cstring16("move_resize")
 	window_class := win.WNDCLASSW {
-		lpfnWndProc = window_proc,
+		lpfnWndProc   = window_proc,
 		lpszClassName = CLASS_NAME,
-		hInstance = instance,
+		hInstance     = instance,
 	}
 	class := win.RegisterClassW(&window_class)
 	assert(class != 0, "Failed to create class")
 
 	hwnd := win.CreateWindowW(
 		CLASS_NAME,
-		cstring16("test"),
+		cstring16("mover sizer"),
 		0,
-		win.CW_USEDEFAULT, win.CW_USEDEFAULT, win.CW_USEDEFAULT, win.CW_USEDEFAULT,
+		10, 10, 10, 10,
 		nil,
 		nil,
 		instance,
@@ -265,23 +310,32 @@ main :: proc() {
 	)
 	assert(hwnd != nil, "Failed to create window")
 
-
+	// system tray setup
+	nid := win.NOTIFYICONDATAW {
+		cbSize           = size_of(win.NOTIFYICONDATAW),
+		hWnd             = hwnd,
+		uID              = 1,
+		uFlags           = win.NIF_MESSAGE | win.NIF_ICON,
+		uCallbackMessage = CONTEXT_MENU_MSG,
+		hIcon            = win.LoadIconA(nil, win.IDI_APPLICATION)
+	}
+	win.Shell_NotifyIconW(win.NIM_ADD, &nid)
+	defer win.Shell_NotifyIconW(win.NIM_DELETE, &nid)
 
 	// setup hook shit
-	hook_handle := win.SetWindowsHookExW(win.WH_MOUSE_LL, hook_on_mouse_event, nil, 0)
-
+	g_state.enabled = true
 	for &k in g_state.mod_keys {
 		k = -1
 	}
 	g_state.mod_keys[0] = win.VK_SHIFT
 	g_state.mod_keys[1] = win.VK_CONTROL
 
-	//
+	hook_handle := win.SetWindowsHookExW(win.WH_MOUSE_LL, hook_on_mouse_event, nil, 0)
+	defer win.UnhookWindowsHookEx(hook_handle)
+
 	msg: win.MSG
 	for win.GetMessageW(&msg, nil, 0, 0) != 0 {
 		win.TranslateMessage(&msg)
 		win.DispatchMessageW(&msg)
 	}
-
-	win.UnhookWindowsHookEx(hook_handle)
 }
