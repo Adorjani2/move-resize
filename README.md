@@ -1,4 +1,4 @@
-### KDE move resize for windows
+# KDE move resize for windows
 
 [one already exists](https://corz.org/windows/software/accessories/KDE-resizing-moving-for-Windows.php) but it's laggy (for me at least), so i decided to implement one with the winapi in Odin
 
