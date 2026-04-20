@@ -1,6 +1,6 @@
 # KDE move resize for windows
 
-[one already exists](https://corz.org/windows/software/accessories/KDE-resizing-moving-for-Windows.php) but it's laggy (for me at least), so i decided to implement one with the winapi in Odin
+[one already exists](https://corz.org/windows/software/accessories/KDE-resizing-moving-for-Windows.php) but it's laggy (for me at least), and it did not work in ableton when i wanted to move plugin windows; so i decided to implement one with the winapi in Odin
 
 ## Usage
 - currently only supports Ctr + Shift
