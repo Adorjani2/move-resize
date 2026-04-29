@@ -4,6 +4,9 @@ package main
 import "base:runtime"
 import "core:fmt"
 import "core:mem"
+import "core:os"
+import str "core:strings"
+import "core:unicode/utf16"
 import vmem "core:mem/virtual"
 import win "core:sys/windows"
 
@@ -16,6 +19,10 @@ foreign user32 {
 
 NAME_BUFF_LEN :: 2048
 INIT_RUNNING_EXES_CAP :: 512
+
+CONFIG_FILE_NAME :: ".move_resize"
+CONFIG_FILE_SECTION_SETTINGS :: "[settings]"
+CONFIG_FILE_SECTION_EXCLUDE  :: "[exclude]"
 
 MAX_MOD_KEYS :: 3
 CONTEXT_MENU_MSG :: win.WM_APP + 1
@@ -33,6 +40,15 @@ App_State :: struct {
 	win_handle        : win.HWND,
 	win_rect_at_start : win.RECT,
 	mouse_at_start    : win.POINT,
+}
+
+
+// Cstring16_Len :: struct {s: cstring16, u16_len: int}
+
+Config_Load_State :: enum {
+	None,
+	Settings,
+	Exclude,
 }
 
 
@@ -88,7 +104,7 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 				}
 
 				buff : [NAME_BUFF_LEN]u16
-				if !query_window_process_exe(final_state.win_handle, buff[:]) {
+				if !query_window_process_exe_name(final_state.win_handle, buff[:]) {
 					break outter_switch
 				}
 				name, _, _, _ := get_exe_name_from_path(buff[:])
@@ -342,7 +358,8 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 						unordered_remove(&g_state.excl_exes, found_index)
 					} else {
 						ns := make([]u16, len(exclude_name))
-						mem.copy(&ns[0], (transmute(runtime.Raw_Cstring16)exclude_name).data, len(ns) * size_of(u16))
+						size := len(ns) * size_of(u16)
+						mem.copy(&ns[0], (transmute(runtime.Raw_Cstring16)exclude_name).data, size)
 						append(&g_state.excl_exes, cstring16(cast([^]u16)&ns[0]))
 					}
 				}
@@ -371,7 +388,7 @@ refresh_running_exes :: proc() {
 
 		buff : [NAME_BUFF_LEN]u16
 
-		if !query_window_process_exe(hwnd, buff[:]) {
+		if !query_window_process_exe_name(hwnd, buff[:]) {
 			continue
 		}
 
@@ -422,7 +439,7 @@ clear_running_exes :: proc() {
 
 
 
-query_window_process_exe :: proc(hwnd: win.HWND, buff: []u16) -> bool {
+query_window_process_exe_name :: proc(hwnd: win.HWND, buff: []u16) -> bool {
 	pid : win.DWORD = 0
 	win.GetWindowThreadProcessId(hwnd, &pid)
 	if pid == 0 {
@@ -445,7 +462,98 @@ query_window_process_exe :: proc(hwnd: win.HWND, buff: []u16) -> bool {
 
 
 
+write_settings_file :: proc() {
+	buff : [NAME_BUFF_LEN]u16
+	path := win.GetModuleFileNameW(nil, &buff[0], NAME_BUFF_LEN)
+	_, last_slash_index, _, _ := get_exe_name_from_path(buff[:])
+	bbuff : [NAME_BUFF_LEN * 2]u8
+	utf16.decode_to_utf8(bbuff[:], buff[:last_slash_index + 1])
+	dir_path := string(bbuff[:last_slash_index + 1])
+
+	arena_chkpt := vmem.arena_temp_begin(&g_state.running_exes_arena)
+	defer vmem.arena_temp_end(arena_chkpt)
+
+	file_path := str.join({dir_path, CONFIG_FILE_NAME}, "\\", g_state.running_exes_alloc)
+
+	file, oerr := os.open(file_path, {.Create, .Write, .Trunc})
+	assert(oerr == nil, "Failed to open or create settings file")
+	defer os.close(file)
+
+	// actual writing
+	b := str.builder_make_none(g_state.running_exes_alloc)
+	str.write_string(&b, "[settings]\n")
+
+	str.write_string(&b, "[exclude]\n")
+	for excl in g_state.excl_exes {
+		tmp := fmt.aprintf(fmt = "%v\n", args = {excl}, allocator = g_state.running_exes_alloc)
+		str.write_string(&b, tmp)
+	}
+	str.pop_byte(&b)
+
+	final := str.to_string(b)
+
+	_, werr := os.write_string(file, final)
+	assert(werr == nil, "Failed to write settings file")
+}
+
+
+
+load_settings_file :: proc() {
+	buff : [NAME_BUFF_LEN]u16
+	path := win.GetModuleFileNameW(nil, &buff[0], NAME_BUFF_LEN)
+	_, last_slash_index, _, _ := get_exe_name_from_path(buff[:])
+	bbuff : [NAME_BUFF_LEN * 2]u8
+	utf16.decode_to_utf8(bbuff[:], buff[:last_slash_index + 1])
+	dir_path := string(bbuff[:last_slash_index + 1])
+
+	arena_chkpt := vmem.arena_temp_begin(&g_state.running_exes_arena)
+	defer vmem.arena_temp_end(arena_chkpt)
+
+	file_path := str.join({dir_path, CONFIG_FILE_NAME}, "\\", g_state.running_exes_alloc)
+
+	if !os.exists(file_path) {
+		return
+	}
+
+	bytes, oerr := os.read_entire_file(file_path, g_state.running_exes_alloc)
+	assert(oerr == nil, "Failed to open or create settings file")
+	
+	load_state := Config_Load_State.None
+	lines := str.split(string(bytes), "\n", g_state.running_exes_alloc)
+	for l in lines {
+		switch l {
+			case CONFIG_FILE_SECTION_EXCLUDE: {
+				load_state = .Exclude
+				continue
+			}
+		}
+
+		switch load_state {
+			case .None:
+			case .Settings:
+			case .Exclude: {
+				exclude := str.trim(l, " \n")
+				write_count := utf16.encode_string(buff[:], exclude)
+				write_count *= 2
+				ns := make([]u16, write_count)
+				mem.copy(&ns[0], &buff[0], write_count)
+				append(&g_state.excl_exes, cstring16(cast([^]u16)&ns[0]))
+			}
+		}
+	}
+}
+
+
+
 main :: proc() {
+	// arena setup
+	arena_err := vmem.arena_init_growing(&g_state.running_exes_arena)
+	assert(arena_err == .None, "Failed to init arena")
+	g_state.running_exes_alloc = vmem.arena_allocator(&g_state.running_exes_arena)
+	defer vmem.arena_destroy(&g_state.running_exes_arena)
+
+	load_settings_file()
+
 	// setup windows shits (for the system tray bs)
 	instance := win.HINSTANCE(win.GetModuleHandleW(nil))
 	assert(instance != nil, "Failed to get exe instance")
@@ -494,16 +602,12 @@ main :: proc() {
 	hook_handle := win.SetWindowsHookExW(win.WH_MOUSE_LL, hook_on_mouse_event, nil, 0)
 	defer win.UnhookWindowsHookEx(hook_handle)
 
-	arena_err := vmem.arena_init_growing(&g_state.running_exes_arena)
-	assert(arena_err == .None, "Failed to init arena")
-	g_state.running_exes_alloc = vmem.arena_allocator(&g_state.running_exes_arena)
-	defer vmem.arena_destroy(&g_state.running_exes_arena)
-
 	msg: win.MSG
 	for win.GetMessageW(&msg, nil, 0, 0) != 0 {
 		win.TranslateMessage(&msg)
 		win.DispatchMessageW(&msg)
 	}
 
+	write_settings_file()
 	clear_running_exes()
 }
