@@ -3,22 +3,26 @@ package main
 
 import "base:runtime"
 import "core:fmt"
-import "core:math"
+import "core:mem"
+import vmem "core:mem/virtual"
 import win "core:sys/windows"
 
 foreign import user32 "system:User32.lib"
 @(default_calling_convention="system")
 foreign user32 {
-	BlockInput :: proc(fBlockIt: win.BOOL) -> win.BOOL ---
+	QueryFullProcessImageNameW :: proc(hProcess: win.HANDLE, dwFlags: win.DWORD, lpExeName: win.LPWSTR, lpdwSize: win.PDWORD) -> win.BOOL ---
 }
 
 
+NAME_BUFF_LEN :: 2048
+INIT_RUNNING_EXES_CAP :: 512
 
 MAX_MOD_KEYS :: 3
 CONTEXT_MENU_MSG :: win.WM_APP + 1
 
 COMMAND_EXIT :: 1
 COMMAND_TOGGLE_ENABLE :: 2
+COMMAND_EXCLUDE_APP :: 3
 
 
 App_State :: struct {
@@ -33,10 +37,17 @@ App_State :: struct {
 
 
 g_state := struct {
-	mod_keys     : [MAX_MOD_KEYS]win.INT,
-	enabled      : bool,
+	mod_keys : [MAX_MOD_KEYS]win.INT,
+	enabled  : bool,
+
+	running_exes_arena : vmem.Arena,
+	running_exes_alloc : mem.Allocator,
+	running_exes       : [dynamic]cstring16,
+	excl_exes          : [dynamic]cstring16,
+
 	using _state : App_State,
 }{}
+
 
 
 // https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelmouseproc
@@ -74,6 +85,18 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 				for tmp_handle := win.GetParent(final_state.win_handle); tmp_handle != nil; {
 					final_state.win_handle = tmp_handle
 					tmp_handle = win.GetParent(final_state.win_handle)
+				}
+
+				buff : [NAME_BUFF_LEN]u16
+				if !query_window_process_exe(final_state.win_handle, buff[:]) {
+					break outter_switch
+				}
+				name, _, _, _ := get_exe_name_from_path(buff[:])
+
+				for e in g_state.excl_exes {
+					if name == e {
+						break outter_switch
+					}
 				}
 
 				if win.IsZoomed(final_state.win_handle) {
@@ -254,8 +277,6 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 	    		break
 	    	}
 
-	    	fmt.println("menu")
-
 	    	p : win.POINT
 	    	win.GetCursorPos(&p)
 
@@ -264,9 +285,25 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 	    		menu,
 	    		win.MF_STRING | win.MF_ENABLED | (g_state.enabled ? win.MF_CHECKED : win.MF_UNCHECKED),
 	    		COMMAND_TOGGLE_ENABLE,
-	    		cstring16("Enabled")
+	    		"Enabled"
 	    	)
-	    	win.AppendMenuW(menu, win.MF_STRING | win.MF_ENABLED, COMMAND_EXIT, cstring16("Exit"))
+
+	    	refresh_running_exes()
+	    	excl_menu := win.CreatePopupMenu()
+	    	for exe, index in g_state.running_exes {
+	    		found := false
+	    		for exc in g_state.excl_exes {
+	    			if exe == exc {
+	    				found = true
+	    				break
+	    			}
+	    		}
+	    		flags : win.UINT = win.MF_STRING | (found ? win.MF_CHECKED : 0)
+	    		win.AppendMenuW(excl_menu, flags, win.UINT_PTR(COMMAND_EXCLUDE_APP + index) , exe)
+	    	}
+	    	win.AppendMenuW(menu, win.MF_POPUP | win.MF_STRING, cast(win.UINT_PTR)excl_menu, "Exclude Apps")
+
+	    	win.AppendMenuW(menu, win.MF_STRING | win.MF_ENABLED, COMMAND_EXIT, "Exit")
 
 	    	win.SetForegroundWindow(hwnd)
 	    	win.TrackPopupMenu(menu, win.TPM_LEFTALIGN, p.x, p.y, 0, hwnd, nil)
@@ -282,11 +319,128 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 	    		case COMMAND_TOGGLE_ENABLE: {
 	    			g_state.enabled = !g_state.enabled
 	    		}
+
+	    		// App exlude
+				case: {
+					if wparam < COMMAND_EXCLUDE_APP {
+						break
+					}
+
+					exclude_index := uint(wparam) - COMMAND_EXCLUDE_APP
+					exclude_name := g_state.running_exes[exclude_index]
+
+					found_index := -1
+					for e, i in g_state.excl_exes {
+						if exclude_name == e {
+							found_index = i
+							break
+						}
+					}
+
+					if found_index >= 0 {
+						delete(g_state.excl_exes[found_index])
+						unordered_remove(&g_state.excl_exes, found_index)
+					} else {
+						ns := make([]u16, len(exclude_name))
+						mem.copy(&ns[0], (transmute(runtime.Raw_Cstring16)exclude_name).data, len(ns) * size_of(u16))
+						append(&g_state.excl_exes, cstring16(cast([^]u16)&ns[0]))
+					}
+				}
 	    	}
 	    }
     }
 
 	return win.DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+
+
+refresh_running_exes :: proc() {
+	clear_running_exes()
+	g_state.running_exes = make([dynamic]cstring16, 0, INIT_RUNNING_EXES_CAP, g_state.running_exes_alloc)
+
+	for hwnd := win.GetTopWindow(nil); hwnd != nil; hwnd = win.GetWindow(hwnd, win.GW_HWNDNEXT) {
+		if !win.IsWindowVisible(hwnd) {
+			continue
+		}
+
+		style := win.GetWindowLongPtrW(hwnd, win.GWL_STYLE)
+		if (style & int(win.WS_THICKFRAME)) == 0 {
+			continue
+		}
+
+		buff : [NAME_BUFF_LEN]u16
+
+		if !query_window_process_exe(hwnd, buff[:]) {
+			continue
+		}
+
+		name, last_slash_index, path_len, name_len := get_exe_name_from_path(buff[:])
+
+		found := false
+		for exe in g_state.running_exes {
+			if runtime.cstring16_eq(name, exe) {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+
+		raw_data := make([]u16, path_len, g_state.running_exes_alloc)
+		mem.copy(&raw_data[0], &buff[last_slash_index + 1], name_len * size_of(u16))
+		append(&g_state.running_exes, cstring16(cast([^]u16)&raw_data[0]))
+	}
+}
+
+
+
+get_exe_name_from_path :: proc(buff: []u16) -> (name: cstring16, last_slash_index, path_len, name_len: int) {
+	last_slash_index = 0
+	path_len = 0 // includes null
+	for b, i in buff {
+		if b == '\\' {
+			last_slash_index = i
+		}
+
+		if b == 0 {
+			path_len = i + 1
+			break
+		}
+	}
+	name_len = path_len - last_slash_index
+	name = cstring16(cast([^]u16)&buff[last_slash_index + 1])
+	return
+}
+
+
+
+clear_running_exes :: proc() {
+	vmem.arena_free_all(&g_state.running_exes_arena)
+}
+
+
+
+query_window_process_exe :: proc(hwnd: win.HWND, buff: []u16) -> bool {
+	pid : win.DWORD = 0
+	win.GetWindowThreadProcessId(hwnd, &pid)
+	if pid == 0 {
+		return false
+	}
+
+	hpid := win.OpenProcess(win.PROCESS_QUERY_INFORMATION | win.PROCESS_VM_READ , false, pid)
+	if hpid == nil {
+		return false
+	}
+	defer win.CloseHandle(hpid)
+
+	bl := win.DWORD(len(buff))
+	if !QueryFullProcessImageNameW(hpid, 0, &buff[0], &bl) {
+		return false
+	}
+
+	return true
 }
 
 
@@ -340,9 +494,16 @@ main :: proc() {
 	hook_handle := win.SetWindowsHookExW(win.WH_MOUSE_LL, hook_on_mouse_event, nil, 0)
 	defer win.UnhookWindowsHookEx(hook_handle)
 
+	arena_err := vmem.arena_init_growing(&g_state.running_exes_arena)
+	assert(arena_err == .None, "Failed to init arena")
+	g_state.running_exes_alloc = vmem.arena_allocator(&g_state.running_exes_arena)
+	defer vmem.arena_destroy(&g_state.running_exes_arena)
+
 	msg: win.MSG
 	for win.GetMessageW(&msg, nil, 0, 0) != 0 {
 		win.TranslateMessage(&msg)
 		win.DispatchMessageW(&msg)
 	}
+
+	clear_running_exes()
 }

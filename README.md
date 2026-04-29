@@ -20,3 +20,4 @@ simply run build.bat
 - [] exclude specific apps
 - [] customizable shortcut
 - [] icon for systray and exe
+- [] screen edge/corner snap zones
