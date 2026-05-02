@@ -115,27 +115,33 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 					}
 				}
 
-				if win.IsZoomed(final_state.win_handle) {
-					win.ShowWindow(final_state.win_handle, win.SW_RESTORE)
-				}
-
-				if win.GetWindowRect(final_state.win_handle, &final_state.win_rect_at_start) {
-					final_state.state = msg_id == win.WM_LBUTTONDOWN ? .Moving : .Resizing
-				} else {
-					break outter_switch
-				}
-
 				fullscreen_size := [?]win.LONG{
 					win.GetSystemMetrics(win.SM_CXSCREEN),
 					win.GetSystemMetrics(win.SM_CYSCREEN)
 				}
+
+				// @Note: it seems like some apps are still considered zoomed if you make them fullscreen after maximizing
+				// so we have to check if its fullscreen first, if not unzoom, and then get the window size again
+				if !win.GetWindowRect(final_state.win_handle, &final_state.win_rect_at_start) {
+					break outter_switch
+				}
 				if get_rect_size(final_state.win_rect_at_start) == fullscreen_size {
-					return 1
+					break outter_switch
+				}
+
+				if win.IsZoomed(final_state.win_handle) {
+					win.ShowWindow(final_state.win_handle, win.SW_RESTORE)
+				}
+
+				if !win.GetWindowRect(final_state.win_handle, &final_state.win_rect_at_start) {
+					break outter_switch
 				}
 
 				if !win.GetCursorPos(&final_state.mouse_at_start) {
 					break outter_switch
 				}
+
+				final_state.state = msg_id == win.WM_LBUTTONDOWN ? .Moving : .Resizing
 
 				if msg_id == win.WM_RBUTTONDOWN {
 					_ms := final_state.mouse_at_start
