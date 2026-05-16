@@ -17,6 +17,7 @@ simply run build.bat
 2. Add shortcut to the .exe in the directory that opened up
 
 ## TODO
-- [] customizable shortcut
-- [] icon for systray and exe
-- [] screen edge/corner snap zones
+- alternate window filtering on title with regex
+- customizable shortcut
+- icon for systray and exe
+- screen edge/corner snap zones
