@@ -20,4 +20,4 @@ simply run build.bat
 - alternate window filtering on title with regex
 - customizable shortcut
 - icon for systray and exe
-- screen edge/corner snap zones
+- fix being able to do mouse down events while already moving/resizing if you press the other mouse buttons

@@ -17,33 +17,41 @@ foreign user32 {
 }
 
 
-NAME_BUFF_LEN :: 2048
+NAME_BUFF_LEN         :: 2048
 INIT_RUNNING_EXES_CAP :: 512
 
-CONFIG_FILE_NAME :: ".move_resize"
+CONFIG_FILE_NAME             :: ".move_resize"
 CONFIG_FILE_SECTION_SETTINGS :: "[settings]"
 CONFIG_FILE_SECTION_EXCLUDE  :: "[exclude]"
 
-MAX_MOD_KEYS :: 3
+MAX_MOD_KEYS     :: 3
 CONTEXT_MENU_MSG :: win.WM_APP + 1
 
-COMMAND_EXIT :: 1
+SNAP_ZONE_SIZE_PERCENTAGE :: .1
+
+COMMAND_EXIT          :: 1
 COMMAND_TOGGLE_ENABLE :: 2
-COMMAND_EXCLUDE_APP :: 3
+COMMAND_EXCLUDE_APP   :: 3
 
+Action :: enum {
+	None,
+	Moving,
+	Resizing,
+	Snapping
+}
 
-App_State :: struct {
-	state : enum {None, Moving, Resizing},
+Move_State :: struct {
+	action : Action,
 
 	resize_type : enum {Top_Left, Top_Right, Bottom_Left, Bottom_Right},
+
+	snap_with_key : bool, // if true snapping was started with the key shortcut, else with middle mouse button
 
 	win_handle        : win.HWND,
 	win_rect_at_start : win.RECT,
 	mouse_at_start    : win.POINT,
 }
 
-
-// Cstring16_Len :: struct {s: cstring16, u16_len: int}
 
 Config_Load_State :: enum {
 	None,
@@ -52,16 +60,34 @@ Config_Load_State :: enum {
 }
 
 
+@rodata
+ACTION_TO_MOUSE_DOWN := #partial[Action]win.WPARAM{
+	.Moving = win.WM_LBUTTONDOWN,
+	.Resizing = win.WM_RBUTTONDOWN,
+	.Snapping = win.WM_MBUTTONDOWN,
+}
+
+@rodata
+ACTION_TO_MOUSE_UP := #partial[Action]win.WPARAM{
+	.Moving = win.WM_LBUTTONUP,
+	.Resizing = win.WM_RBUTTONUP,
+	.Snapping = win.WM_MBUTTONUP,
+}
+
+SNAP_SHORTCUT_MOUSE_STARTER_BUTTON :: Action.Moving
+
+
 g_state := struct {
-	mod_keys : [MAX_MOD_KEYS]win.INT,
-	enabled  : bool,
+	mod_keys   : [MAX_MOD_KEYS]win.INT,
+	snap_key   : win.INT,
+	enabled    : bool,
 
 	running_exes_arena : vmem.Arena,
 	running_exes_alloc : mem.Allocator,
 	running_exes       : [dynamic]cstring16,
 	excl_exes          : [dynamic]cstring16,
 
-	using _state : App_State,
+	using _state : Move_State,
 }{}
 
 
@@ -75,24 +101,35 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 	context = runtime.default_context()
 	event := (transmute(^win.MSLLHOOKSTRUCT)ptr_msllhook)^
 
-	need_to_clear_state :=
-		(msg_id == win.WM_LBUTTONUP && g_state.state == .Moving) ||
-		(msg_id == win.WM_RBUTTONUP && g_state.state == .Resizing)
+	for id, action in ACTION_TO_MOUSE_UP {
+		if g_state.action == action && msg_id == id {
+			clear_state()
+			return 1
+		}
+	}
 
-	if need_to_clear_state {
+	if g_state.action == .Snapping && g_state.snap_with_key && msg_id == ACTION_TO_MOUSE_UP[SNAP_SHORTCUT_MOUSE_STARTER_BUTTON] {
 		clear_state()
 		return 1
 	}
 
-	outter_switch: switch g_state.state {
+	outter_switch: switch g_state.action {
 		case .None: {
-			if !are_mod_keys_down() {
+			if !is_main_shortcut_down() {
 				break outter_switch
 			}
 
-			final_state : App_State
+			final_state : Move_State
 
-			if msg_id == win.WM_LBUTTONDOWN || msg_id == win.WM_RBUTTONDOWN {
+			start_action : bool
+			for id in ACTION_TO_MOUSE_DOWN {
+				if msg_id == id {
+					start_action = true
+					break
+				}
+			}
+
+			if start_action {
 				final_state.win_handle = win.WindowFromPoint(event.pt)
 				if final_state.win_handle == nil {
 					break outter_switch
@@ -115,10 +152,17 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 					}
 				}
 
-				fullscreen_size := [?]win.LONG{
-					win.GetSystemMetrics(win.SM_CXSCREEN),
-					win.GetSystemMetrics(win.SM_CYSCREEN)
+				if !win.GetCursorPos(&final_state.mouse_at_start) {
+					break outter_switch
 				}
+
+				monitor := win.MonitorFromPoint(final_state.mouse_at_start, .MONITOR_DEFAULTTONEAREST)
+				monitor_info : win.MONITORINFO
+				monitor_info.cbSize = size_of(win.MONITORINFO)
+				if !win.GetMonitorInfoW(monitor, &monitor_info) {
+					break outter_switch
+				}
+				fullscreen_size := get_rect_size(monitor_info.rcMonitor)
 
 				// @Note: it seems like some apps are still considered zoomed if you make them fullscreen after maximizing
 				// so we have to check if its fullscreen first, if not unzoom, and then get the window size again
@@ -137,13 +181,24 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 					break outter_switch
 				}
 
-				if !win.GetCursorPos(&final_state.mouse_at_start) {
-					break outter_switch
+				// @Note: since touchpads dont have middle mouse button
+				// just simply override if the keyboard button is down,
+				// you can use both mmb and the key to start snapping
+				if is_snap_shortcut_down() && msg_id == ACTION_TO_MOUSE_DOWN[SNAP_SHORTCUT_MOUSE_STARTER_BUTTON] {
+					final_state.action = .Snapping
+					final_state.snap_with_key = true
+				} else {
+					switch msg_id {
+						case ACTION_TO_MOUSE_DOWN[.Moving]: final_state.action = .Moving
+						case ACTION_TO_MOUSE_DOWN[.Resizing]: final_state.action = .Resizing
+						case ACTION_TO_MOUSE_DOWN[.Snapping]: final_state.action = .Snapping
+						case: {
+							break outter_switch
+						}
+					}
 				}
 
-				final_state.state = msg_id == win.WM_LBUTTONDOWN ? .Moving : .Resizing
-
-				if msg_id == win.WM_RBUTTONDOWN {
+				if final_state.action == .Resizing {
 					_ms := final_state.mouse_at_start
 					if !win.ScreenToClient(final_state.win_handle, &_ms) {
 						break outter_switch
@@ -159,6 +214,8 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 				}
 
 				g_state._state = final_state
+
+				// fmt.printfln("state: %v", g_state.action)
 
 				return 1
 			}
@@ -179,7 +236,6 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 			window_top_left := get_top_left(g_state.win_rect_at_start)
 
 			new_pos := window_top_left + mouse_delta
-
 			if !win.MoveWindow(g_state.win_handle, new_pos.x, new_pos.y, window_size.x, window_size.y, true) {
 				clear_state()
 				break outter_switch
@@ -229,6 +285,93 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 				break outter_switch
 			}
 		}
+
+		case .Snapping: {
+			// get cursor pos
+			cursor_pos_l : win.POINT
+			if !win.GetCursorPos(&cursor_pos_l) {
+				clear_state()
+				break outter_switch
+			}
+			cursor_global_pos := [2]f64{f64(cursor_pos_l.x), f64(cursor_pos_l.y)}
+
+			monitor := win.MonitorFromPoint(cursor_pos_l, .MONITOR_DEFAULTTONEAREST)
+			monitor_info : win.MONITORINFO
+			monitor_info.cbSize = size_of(win.MONITORINFO)
+			if !win.GetMonitorInfoW(monitor, &monitor_info) {
+				clear_state()
+				break outter_switch
+			}
+			fullscreen_size_l   := get_rect_size(monitor_info.rcWork)
+			screen_global_pos_l := get_top_left(monitor_info.rcWork)
+			fullscreen_size     := [2]f64{f64(fullscreen_size_l.x), f64(fullscreen_size_l.y)}
+			screen_global_pos   := [2]f64{f64(screen_global_pos_l.x), f64(screen_global_pos_l.y)}
+
+			cursor_local_pos := cursor_global_pos - screen_global_pos
+			c01 := cursor_local_pos / fullscreen_size
+
+			s13 := f64(1./3.)
+			s23 := f64(2./3.)
+
+			fsh := fullscreen_size_l / 2
+			new_pos := get_top_left(g_state.win_rect_at_start)
+			new_size := get_rect_size(g_state.win_rect_at_start)
+
+			if c01.x <= s13 && c01.y <= s13 { // corner top left
+				new_pos = {
+					monitor_info.rcWork.left,
+					monitor_info.rcWork.top,
+				}
+				new_size = fsh
+			} else if c01.x >= s23 && c01.y <= s13 { // corner top right
+				new_pos = {
+					monitor_info.rcWork.left + fsh.x,
+					monitor_info.rcWork.top,
+				}
+				new_size = fsh
+			} else if c01.x <= s13 && c01.y >= s23 { // corner bottom left
+				new_pos = {
+					monitor_info.rcWork.left,
+					monitor_info.rcWork.top + fsh.y,
+				}
+				new_size = fsh
+			} else if c01.x >= s23 && c01.y >= s23 { // corner bottom right
+				new_pos = {
+					monitor_info.rcWork.left + fsh.x,
+					monitor_info.rcWork.top + fsh.y,
+				}
+				new_size = fsh
+			} else if c01.x <= s13 { // left side
+				new_pos = {
+					monitor_info.rcWork.left,
+					monitor_info.rcWork.top,
+				}
+				new_size = {
+					fsh.x,
+					fullscreen_size_l.y
+				}
+			} else if c01.x >= s23 { // right side
+				new_pos = {
+					monitor_info.rcWork.left + fsh.x,
+					monitor_info.rcWork.top,
+				}
+				new_size = {
+					fsh.x,
+					fullscreen_size_l.y
+				}
+			} else if c01.y <= .5 { // maximize
+				new_pos = {
+					monitor_info.rcWork.left,
+					monitor_info.rcWork.top,
+				}
+				new_size = fullscreen_size_l
+			}
+
+			if !win.MoveWindow(g_state.win_handle, new_pos.x, new_pos.y, new_size.x, new_size.y, true) {
+				clear_state()
+				break outter_switch
+			}
+		}
 	}
 
 	return win.CallNextHookEx(nil, code, msg_id, ptr_msllhook)
@@ -240,6 +383,7 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 get_rect_size :: proc(r: win.RECT) -> [2]win.LONG {
 	return {r.right - r.left, r.bottom - r.top}
 }
+
 
 
 @(require_results)
@@ -266,12 +410,13 @@ get_top_left :: proc(r: win.RECT) -> [2]win.LONG {
 
 
 clear_state :: proc() {
+	// fmt.println("clear")
 	g_state._state = {}
 }
 
 
 
-are_mod_keys_down :: proc() -> bool {
+is_main_shortcut_down :: proc() -> bool {
 	for mk in g_state.mod_keys {
 		if mk < 0 do continue
 
@@ -281,6 +426,12 @@ are_mod_keys_down :: proc() -> bool {
 	}
 
 	return true
+}
+
+
+
+is_snap_shortcut_down :: proc() -> bool {
+	return win.GetKeyState(g_state.snap_key) < 0
 }
 
 
@@ -604,6 +755,7 @@ main :: proc() {
 	}
 	g_state.mod_keys[0] = win.VK_SHIFT
 	g_state.mod_keys[1] = win.VK_CONTROL
+	g_state.snap_key = win.VK_MENU // ALT keycode
 
 	hook_handle := win.SetWindowsHookExW(win.WH_MOUSE_LL, hook_on_mouse_event, nil, 0)
 	defer win.UnhookWindowsHookEx(hook_handle)
