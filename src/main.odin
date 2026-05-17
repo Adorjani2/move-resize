@@ -360,11 +360,14 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 					fullscreen_size_l.y
 				}
 			} else if c01.y <= .5 { // maximize
+				// @Note: one pixel off cause of the fullscreen detection gets softlocked otherwise
+				// @Todo: proper zoom/maximize not just window size setting
 				new_pos = {
 					monitor_info.rcWork.left,
-					monitor_info.rcWork.top,
+					monitor_info.rcWork.top + 1,
 				}
 				new_size = fullscreen_size_l
+				new_size.y -= 1
 			}
 
 			if !win.MoveWindow(g_state.win_handle, new_pos.x, new_pos.y, new_size.x, new_size.y, true) {
