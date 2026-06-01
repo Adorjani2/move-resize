@@ -17,8 +17,8 @@ foreign user32 {
 }
 
 
-NAME_BUFF_LEN         :: 2048
-INIT_RUNNING_EXES_CAP :: 512
+STR_BUFF_LEN             :: 2048
+INIT_RUNNING_WINDOWS_CAP :: 512
 
 CONFIG_FILE_NAME             :: ".move_resize"
 CONFIG_FILE_SECTION_SETTINGS :: "[settings]"
@@ -60,32 +60,58 @@ Config_Load_State :: enum {
 }
 
 
+Exclusion_Type :: enum {
+	Exe_Name,
+	Window_Title,
+}
+
+
+Running_Window :: struct {
+	exe_name  : cstring16,
+	win_title : cstring16,
+}
+
+
+Window_Filter :: struct {
+	type  : Exclusion_Type,
+	text  : cstring16,
+	count : i32, // u16 count in text (\0 included)
+}
+
+
 @rodata
 ACTION_TO_MOUSE_DOWN := #partial[Action]win.WPARAM{
-	.Moving = win.WM_LBUTTONDOWN,
+	.Moving   = win.WM_LBUTTONDOWN,
 	.Resizing = win.WM_RBUTTONDOWN,
 	.Snapping = win.WM_MBUTTONDOWN,
 }
 
 @rodata
 ACTION_TO_MOUSE_UP := #partial[Action]win.WPARAM{
-	.Moving = win.WM_LBUTTONUP,
+	.Moving   = win.WM_LBUTTONUP,
 	.Resizing = win.WM_RBUTTONUP,
 	.Snapping = win.WM_MBUTTONUP,
+}
+
+@rodata
+EXLUSION_TYPE_TO_RUNE := [Exclusion_Type]rune{
+	.Exe_Name = 'e',
+	.Window_Title = 't',
 }
 
 SNAP_SHORTCUT_MOUSE_STARTER_BUTTON :: Action.Moving
 
 
 g_state := struct {
-	mod_keys   : [MAX_MOD_KEYS]win.INT,
-	snap_key   : win.INT,
-	enabled    : bool,
+	mod_keys : [MAX_MOD_KEYS]win.INT,
+	snap_key : win.INT,
+	enabled  : bool,
 
-	running_exes_arena : vmem.Arena,
-	running_exes_alloc : mem.Allocator,
-	running_exes       : [dynamic]cstring16,
-	excl_exes          : [dynamic]cstring16,
+	arena : vmem.Arena, // mainly used for storing the strings for running_windows, but is also used in procedures for local allocations that get cleared before the proc returns
+	alloc : mem.Allocator,
+
+	running_windows : [dynamic]Running_Window,
+	window_filters  : [dynamic]Window_Filter,
 
 	using _state : Move_State,
 }{}
@@ -140,15 +166,33 @@ hook_on_mouse_event :: proc "system" (code: win.c_int, msg_id: win.WPARAM, ptr_m
 					tmp_handle = win.GetParent(final_state.win_handle)
 				}
 
-				buff : [NAME_BUFF_LEN]u16
-				if !query_window_process_exe_name(final_state.win_handle, buff[:]) {
-					break outter_switch
-				}
-				name, _, _, _ := get_exe_name_from_path(buff[:])
-
-				for e in g_state.excl_exes {
-					if name == e {
+				// filtering
+				buff : [STR_BUFF_LEN]u16
+				{   // exe name
+					if !query_window_process_exe_name(final_state.win_handle, buff[:]) {
 						break outter_switch
+					}
+					exe_name, _, _, _ := get_exe_name_from_path(buff[:])
+
+					for f in g_state.window_filters {
+						if f.type == .Window_Title {
+							continue
+						}
+						if exe_name == f.text {
+							break outter_switch
+						}
+					}
+				}
+
+				{   // window title
+					title_len := win.GetWindowTextW(final_state.win_handle, &buff[0], STR_BUFF_LEN) + 1 // + 1 for \0
+					if title_len > 1 {
+						for f in g_state.window_filters {
+							if match_filter_window_title(f, buff[:title_len]) {
+								// fmt.printfln("f: %s, m: %s", f.text, buff[:title_len])
+								break outter_switch
+							}
+						}
 					}
 				}
 
@@ -465,20 +509,49 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 	    	)
 
 	    	refresh_running_exes()
+
+	    	arena_chkpt := vmem.arena_temp_begin(&g_state.arena)
+	    	defer vmem.arena_temp_end(arena_chkpt)
+
+	    	already_added_items := make([dynamic]cstring16, g_state.alloc)
+
 	    	excl_menu := win.CreatePopupMenu()
-	    	for exe, index in g_state.running_exes {
+	    	for exe, index in g_state.running_windows {
+	    		skip_exe := false
+	    		for item in already_added_items {
+	    			if exe.exe_name == item {
+	    				skip_exe = true
+	    				break
+	    			}
+	    		}
+	    		if skip_exe {
+	    			continue
+	    		}
+
 	    		found := false
-	    		for exc in g_state.excl_exes {
-	    			if exe == exc {
+	    		for exc in g_state.window_filters {
+	    			if exe.exe_name == exc.text {
 	    				found = true
 	    				break
 	    			}
 	    		}
-	    		flags : win.UINT = win.MF_STRING | (found ? win.MF_CHECKED : 0)
-	    		win.AppendMenuW(excl_menu, flags, win.UINT_PTR(COMMAND_EXCLUDE_APP + index) , exe)
-	    	}
-	    	win.AppendMenuW(menu, win.MF_POPUP | win.MF_STRING, cast(win.UINT_PTR)excl_menu, "Exclude Apps")
 
+	    		flags : win.UINT = win.MF_STRING | (found ? win.MF_CHECKED : 0)
+	    		win.AppendMenuW(excl_menu, flags, win.UINT_PTR(COMMAND_EXCLUDE_APP + index) , exe.exe_name)
+
+	    		append(&already_added_items, exe.exe_name)
+	    	}
+
+	    	win.AppendMenuW(excl_menu, win.MF_SEPARATOR, win.UINT_PTR(0), nil)
+
+	    	for ew in g_state.window_filters {
+	    		if ew.type == .Exe_Name {
+	    			continue
+	    		}
+	    		win.AppendMenuW(excl_menu, win.MF_STRING | win.MF_GRAYED, win.UINT_PTR(0), ew.text)
+	    	}
+
+	    	win.AppendMenuW(menu, win.MF_POPUP | win.MF_STRING, cast(win.UINT_PTR)excl_menu, "Exclude Apps")
 	    	win.AppendMenuW(menu, win.MF_STRING | win.MF_ENABLED, COMMAND_EXIT, "Exit")
 
 	    	win.SetForegroundWindow(hwnd)
@@ -503,24 +576,30 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 					}
 
 					exclude_index := uint(wparam) - COMMAND_EXCLUDE_APP
-					exclude_name := g_state.running_exes[exclude_index]
+					exclude_name := g_state.running_windows[exclude_index]
 
 					found_index := -1
-					for e, i in g_state.excl_exes {
-						if exclude_name == e {
+					for e, i in g_state.window_filters {
+						if exclude_name.exe_name == e.text {
 							found_index = i
 							break
 						}
 					}
 
 					if found_index >= 0 {
-						delete(g_state.excl_exes[found_index])
-						unordered_remove(&g_state.excl_exes, found_index)
+						delete(g_state.window_filters[found_index].text)
+						unordered_remove(&g_state.window_filters, found_index)
 					} else {
-						ns := make([]u16, len(exclude_name))
+						ns := make([]u16, len(exclude_name.exe_name))
 						size := len(ns) * size_of(u16)
-						mem.copy(&ns[0], (transmute(runtime.Raw_Cstring16)exclude_name).data, size)
-						append(&g_state.excl_exes, cstring16(cast([^]u16)&ns[0]))
+						mem.copy(&ns[0], (transmute(runtime.Raw_Cstring16)exclude_name.exe_name).data, size)
+						append(
+							&g_state.window_filters,
+							Window_Filter{
+								type = .Exe_Name,
+								text = cstring16(cast([^]u16)&ns[0]),
+							}
+						)
 					}
 				}
 	    	}
@@ -533,8 +612,8 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 
 
 refresh_running_exes :: proc() {
-	clear_running_exes()
-	g_state.running_exes = make([dynamic]cstring16, 0, INIT_RUNNING_EXES_CAP, g_state.running_exes_alloc)
+	clear_running_windows()
+	g_state.running_windows = make([dynamic]Running_Window, 0, INIT_RUNNING_WINDOWS_CAP, g_state.alloc)
 
 	for hwnd := win.GetTopWindow(nil); hwnd != nil; hwnd = win.GetWindow(hwnd, win.GW_HWNDNEXT) {
 		if !win.IsWindowVisible(hwnd) {
@@ -546,7 +625,7 @@ refresh_running_exes :: proc() {
 			continue
 		}
 
-		buff : [NAME_BUFF_LEN]u16
+		buff : [STR_BUFF_LEN]u16
 
 		if !query_window_process_exe_name(hwnd, buff[:]) {
 			continue
@@ -554,20 +633,23 @@ refresh_running_exes :: proc() {
 
 		name, last_slash_index, path_len, name_len := get_exe_name_from_path(buff[:])
 
-		found := false
-		for exe in g_state.running_exes {
-			if runtime.cstring16_eq(name, exe) {
-				found = true
-				break
-			}
-		}
-		if found {
-			continue
+		exe_data := make([]u16, path_len, g_state.alloc)
+		mem.copy(&exe_data[0], &buff[last_slash_index + 1], name_len * size_of(u16))
+
+		title_len := win.GetWindowTextW(hwnd, &buff[0], STR_BUFF_LEN)
+		title_data : []u16
+		if title_len > 0 {
+			title_data = make([]u16, title_len + 1, g_state.alloc)
+			mem.copy(&title_data[0], &buff[0], int(title_len + 1) * size_of(u16))
 		}
 
-		raw_data := make([]u16, path_len, g_state.running_exes_alloc)
-		mem.copy(&raw_data[0], &buff[last_slash_index + 1], name_len * size_of(u16))
-		append(&g_state.running_exes, cstring16(cast([^]u16)&raw_data[0]))
+		append(
+			&g_state.running_windows,
+			Running_Window{
+				exe_name = cstring16(cast([^]u16)&exe_data[0]),
+				win_title = title_len > 0 ? cstring16(cast([^]u16)&title_data[0]) : "",
+			}
+		)
 	}
 }
 
@@ -593,13 +675,13 @@ get_exe_name_from_path :: proc(buff: []u16) -> (name: cstring16, last_slash_inde
 
 
 
-clear_running_exes :: proc() {
-	vmem.arena_free_all(&g_state.running_exes_arena)
+clear_running_windows :: proc() {
+	vmem.arena_free_all(&g_state.arena)
 }
 
 
 
-query_window_process_exe_name :: proc(hwnd: win.HWND, buff: []u16) -> bool {
+query_window_process_exe_name :: proc(hwnd: win.HWND, buff: []u16) -> (ok: bool) {
 	pid : win.DWORD = 0
 	win.GetWindowThreadProcessId(hwnd, &pid)
 	if pid == 0 {
@@ -622,30 +704,69 @@ query_window_process_exe_name :: proc(hwnd: win.HWND, buff: []u16) -> bool {
 
 
 
+// buff should contain \0
+match_filter_window_title :: proc(filter: Window_Filter, buff: []u16) -> (contains: bool) {
+	if filter.type == .Exe_Name {
+		return false
+	}
+
+	title_len := cast(win.INT)len(buff)
+
+	if filter.count > title_len {
+		return false
+	}
+
+	if filter.count == 1 || title_len == 1 {
+		return false
+	}
+
+	raw_f := transmute(runtime.Raw_Cstring16)filter.text
+
+	// fmt.printfln("f: %v (%v), m: %v (%v)", filter, filter.count, buff, title_len)
+
+	end_ind := title_len - filter.count
+	for start_ind in 0..=end_ind {
+		if mem.compare_ptrs(&raw_f.data[0], &buff[start_ind], int(filter.count - 1)) == 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+
+
 write_settings_file :: proc() {
-	buff : [NAME_BUFF_LEN]u16
-	path := win.GetModuleFileNameW(nil, &buff[0], NAME_BUFF_LEN)
+	buff : [STR_BUFF_LEN]u16
+	path := win.GetModuleFileNameW(nil, &buff[0], STR_BUFF_LEN)
 	_, last_slash_index, _, _ := get_exe_name_from_path(buff[:])
-	bbuff : [NAME_BUFF_LEN * 2]u8
+	bbuff : [STR_BUFF_LEN * 2]u8
 	utf16.decode_to_utf8(bbuff[:], buff[:last_slash_index + 1])
 	dir_path := string(bbuff[:last_slash_index + 1])
 
-	arena_chkpt := vmem.arena_temp_begin(&g_state.running_exes_arena)
+	arena_chkpt := vmem.arena_temp_begin(&g_state.arena)
 	defer vmem.arena_temp_end(arena_chkpt)
 
-	file_path := str.join({dir_path, CONFIG_FILE_NAME}, "\\", g_state.running_exes_alloc)
+	file_path := str.join({dir_path, CONFIG_FILE_NAME}, "\\", g_state.alloc)
 
 	file, oerr := os.open(file_path, {.Create, .Write, .Trunc})
 	assert(oerr == nil, "Failed to open or create settings file")
 	defer os.close(file)
 
 	// actual writing
-	b := str.builder_make_none(g_state.running_exes_alloc)
+	b := str.builder_make_none(g_state.alloc)
 	str.write_string(&b, "[settings]\n")
 
 	str.write_string(&b, "[exclude]\n")
-	for excl in g_state.excl_exes {
-		tmp := fmt.aprintf(fmt = "%v\n", args = {excl}, allocator = g_state.running_exes_alloc)
+	for excl in g_state.window_filters {
+		tmp := fmt.aprintf(
+			fmt = "%v %v\n",
+			args = {
+				EXLUSION_TYPE_TO_RUNE[excl.type],
+				excl.text,
+			},
+			allocator = g_state.alloc
+		)
 		str.write_string(&b, tmp)
 	}
 	str.pop_byte(&b)
@@ -659,27 +780,27 @@ write_settings_file :: proc() {
 
 
 load_settings_file :: proc() {
-	buff : [NAME_BUFF_LEN]u16
-	path := win.GetModuleFileNameW(nil, &buff[0], NAME_BUFF_LEN)
+	buff : [STR_BUFF_LEN]u16
+	path := win.GetModuleFileNameW(nil, &buff[0], STR_BUFF_LEN)
 	_, last_slash_index, _, _ := get_exe_name_from_path(buff[:])
-	bbuff : [NAME_BUFF_LEN * 2]u8
+	bbuff : [STR_BUFF_LEN * 2]u8
 	utf16.decode_to_utf8(bbuff[:], buff[:last_slash_index + 1])
 	dir_path := string(bbuff[:last_slash_index + 1])
 
-	arena_chkpt := vmem.arena_temp_begin(&g_state.running_exes_arena)
+	arena_chkpt := vmem.arena_temp_begin(&g_state.arena)
 	defer vmem.arena_temp_end(arena_chkpt)
 
-	file_path := str.join({dir_path, CONFIG_FILE_NAME}, "\\", g_state.running_exes_alloc)
+	file_path := str.join({dir_path, CONFIG_FILE_NAME}, "\\", g_state.alloc)
 
 	if !os.exists(file_path) {
 		return
 	}
 
-	bytes, oerr := os.read_entire_file(file_path, g_state.running_exes_alloc)
+	bytes, oerr := os.read_entire_file(file_path, g_state.alloc)
 	assert(oerr == nil, "Failed to open or create settings file")
 	
 	load_state := Config_Load_State.None
-	lines := str.split(string(bytes), "\n", g_state.running_exes_alloc)
+	lines := str.split(string(bytes), "\n", g_state.alloc)
 	for l in lines {
 		switch l {
 			case CONFIG_FILE_SECTION_EXCLUDE: {
@@ -692,12 +813,35 @@ load_settings_file :: proc() {
 			case .None:
 			case .Settings:
 			case .Exclude: {
+				if l == "" {
+					continue
+				}
+
 				exclude := str.trim(l, " \n")
-				write_count := utf16.encode_string(buff[:], exclude)
-				write_count *= 2
+				type_rune := exclude[0]
+				exclude = exclude[2:]
+
+				type : Exclusion_Type
+				switch type_rune {
+					case u8(EXLUSION_TYPE_TO_RUNE[.Exe_Name]):     type = .Exe_Name
+					case u8(EXLUSION_TYPE_TO_RUNE[.Window_Title]): type = .Window_Title
+					case:
+						fmt.eprintfln("Unknown leading exclude symbol: %v", rune(type_rune))
+						continue
+				}
+
+				write_count := utf16.encode_string(buff[:], exclude) + 1
 				ns := make([]u16, write_count)
-				mem.copy(&ns[0], &buff[0], write_count)
-				append(&g_state.excl_exes, cstring16(cast([^]u16)&ns[0]))
+				mem.copy(&ns[0], &buff[0], write_count * 2)
+				ns[write_count-1] = 0
+				append(
+					&g_state.window_filters,
+					Window_Filter{
+						type  = type,
+						text  = cstring16(cast([^]u16)&ns[0]),
+						count = auto_cast write_count
+					}
+				)
 			}
 		}
 	}
@@ -707,10 +851,10 @@ load_settings_file :: proc() {
 
 main :: proc() {
 	// arena setup
-	arena_err := vmem.arena_init_growing(&g_state.running_exes_arena)
+	arena_err := vmem.arena_init_growing(&g_state.arena)
 	assert(arena_err == .None, "Failed to init arena")
-	g_state.running_exes_alloc = vmem.arena_allocator(&g_state.running_exes_arena)
-	defer vmem.arena_destroy(&g_state.running_exes_arena)
+	g_state.alloc = vmem.arena_allocator(&g_state.arena)
+	defer vmem.arena_destroy(&g_state.arena)
 
 	load_settings_file()
 
@@ -770,5 +914,5 @@ main :: proc() {
 	}
 
 	write_settings_file()
-	clear_running_exes()
+	clear_running_windows()
 }

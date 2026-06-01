@@ -6,18 +6,35 @@
 - currently only supports Ctr + Shift
 - Ctrl + Shift + LMB -> move window under cursor
 - Ctrl + Shift + RMB -> resize window under cursor
-- system tray icon to enable/disable or exit
+- Ctrl + Shift + MMB / Ctrl + Shift + Alt + LMB -> snap window to corner / edge or maximize
+- system tray icon
+  - enable/disable
+  - add/remove .exe filters
+  - show title filters defined in the config
+  - exit
+
+## Config file
+creates or reads a file named ".move_resize" at the exes location, saves the filters there
+### [settings]
+TODO
+### [exclude]
+each line after this section is a window filter  
+lines must start with an 'e' or 't' character then a space
+- 'e': exact matches the window exes name
+- 't': checks if a window title contains the given string
+example .move_resize:
+```
+e Windows Terminal.exe
+t Ableton
+```
+this will filter out any windows that were created by "Windows Terminal.exe" or that contain "Ableton" in their window title  
+
 
 ## Building
-needs odin compiler (version 2026-04 as of now)  
+needs odin compiler (version 2026-05 as of now)  
 simply run build.bat
 
-## Run on startup
-1. Win + R -> "shell:startup"
-2. Add shortcut to the .exe in the directory that opened up
-
 ## TODO
-- alternate window filtering on title with regex
 - customizable shortcut
 - icon for systray and exe
 - fix being able to do mouse down events while already moving/resizing if you press the other mouse buttons
