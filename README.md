@@ -21,7 +21,7 @@ TODO
 each line after this section is a window filter  
 lines must start with an 'e' or 't' character then a space
 - 'e': exact matches the window exes name
-- 't': checks if a window title contains the given string
+- 't': checks if a window title contains the given string  
 example .move_resize:
 ```
 e Windows Terminal.exe
