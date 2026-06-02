@@ -14,9 +14,10 @@
   - exit
 
 ## Config file
-creates or reads a file named ".move_resize" at the exes location, saves the filters there
+creates or reads a file named ".move_resize" at the exes location, saves the filters there  
+if you don't need to add title filters then there is no need to write it by hand, you can just add exclude filters from the systray menu
 ### [settings]
-TODO
+TODO: currently unused
 ### [exclude]
 each line after this section is a window filter  
 lines must start with an 'e' or 't' character then a space
@@ -25,6 +26,8 @@ lines must start with an 'e' or 't' character then a space
 
 example .move_resize:
 ```
+[settings]
+[exclude]
 e Windows Terminal.exe
 t Ableton
 ```
